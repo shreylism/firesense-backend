@@ -9,8 +9,9 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ["GATEWAY_API_KEY"]
@@ -44,6 +45,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 class Reading(BaseModel):
+    model_config = ConfigDict(extra='allow')   # unknown fields are kept in the 'extra' column
     device_id: str
     gateway_id: Optional[str] = None
     ts: Optional[datetime] = None
@@ -54,6 +56,8 @@ class Reading(BaseModel):
     temp_c: Optional[float] = None
     pm25: Optional[float] = None
     pm10: Optional[float] = None
+    pm1: Optional[float] = None
+    pm4: Optional[float] = None
     status: int = Field(0, ge=0, le=2)
     raw_b64: Optional[str] = None
 
@@ -106,10 +110,11 @@ def store(c, r: Reading, alerts: Optional[list] = None) -> bool:
         ts = ts.replace(tzinfo=timezone.utc)
     prev = c.execute("select last_status from devices where device_id=%s", (r.device_id,)).fetchone()
     row = c.execute(
-        """insert into readings (device_id,gateway_id,ts,seq,rssi,snr,co_ppm,temp_c,pm25,pm10,status,raw_b64)
-           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """insert into readings (device_id,gateway_id,ts,seq,rssi,snr,co_ppm,temp_c,pm25,pm10,status,raw_b64,pm1,pm4,extra)
+           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            on conflict (device_id,ts,seq) do nothing returning id""",
-        (r.device_id, r.gateway_id, ts, r.seq, r.rssi, r.snr, r.co_ppm, r.temp_c, r.pm25, r.pm10, r.status, r.raw_b64),
+        (r.device_id, r.gateway_id, ts, r.seq, r.rssi, r.snr, r.co_ppm, r.temp_c, r.pm25, r.pm10, r.status, r.raw_b64,
+         r.pm1, r.pm4, Jsonb(r.model_extra) if r.model_extra else None),
     ).fetchone()
     c.execute(
         """insert into devices (device_id,last_seen,last_status) values (%s,%s,%s)
@@ -208,7 +213,7 @@ def history(device_id: str, range: str = Query("1h", pattern="^(1h|24h|7d)$")):
         rows = c.execute(
             """select date_bin(%s::interval, ts, timestamptz '2000-01-01') as ts,
                       avg(co_ppm) as co_ppm, avg(temp_c) as temp_c, avg(pm25) as pm25,
-                      avg(pm10) as pm10, max(status) as status
+                      avg(pm10) as pm10, avg(pm1) as pm1, avg(pm4) as pm4, max(status) as status
                from readings where device_id=%s and ts >= %s group by 1 order by 1""",
             (step, device_id, datetime.now(timezone.utc) - span)).fetchall()
     return rows
@@ -220,7 +225,7 @@ def stats():
 
 @app.get("/api/v1/readings/export.csv")
 def export_csv(device_id: str, hours: int = Query(168, ge=1, le=720)):
-    cols = ["ts", "device_id", "gateway_id", "seq", "rssi", "snr", "co_ppm", "temp_c", "pm25", "pm10", "status"]
+    cols = ["ts", "device_id", "gateway_id", "seq", "rssi", "snr", "co_ppm", "temp_c", "pm1", "pm25", "pm4", "pm10", "status"]
     with pool.connection() as c:
         rows = c.execute(f"select {','.join(cols)} from readings where device_id=%s and ts >= %s order by ts",
                          (device_id, datetime.now(timezone.utc) - timedelta(hours=hours))).fetchall()
