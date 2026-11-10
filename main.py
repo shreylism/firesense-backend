@@ -338,6 +338,37 @@ def admin_delete_device(device_id: str):
         n = c.execute("delete from readings where device_id=%s", (device_id,)).rowcount
         c.execute("delete from devices where device_id=%s", (device_id,))
     return {"deleted_readings": n}
+    
+DEVICE_NAMES = {"node-01": "Node 1"}   # optional friendly names, add more if you like
+
+@app.get("/api/v1/status")
+def live_status():
+    with pool.connection() as c:
+        devs = c.execute(
+            """select d.device_id, d.last_level,
+                      (d.last_seen > now() - make_interval(secs => %s)) as online,
+                      r.co_ppm, r.temp_c, r.pm25, r.pm10
+               from devices d
+               left join lateral (select co_ppm, temp_c, pm25, pm10 from readings
+                                  where device_id = d.device_id order by ts desc limit 1) r on true
+               order by d.device_id""", (ONLINE_SECONDS,)).fetchall()
+        gw = c.execute("""select coalesce(bool_or(last_seen > now() - make_interval(secs => %s)), false) as online
+                          from gateways""", (ONLINE_SECONDS,)).fetchone()
+        tot = c.execute("select count(*) as n from readings").fetchone()
+        last = c.execute("select ts, rssi from readings order by ts desc limit 1").fetchone()
+    f = lambda v: float(v) if v is not None else 0.0
+    out = []
+    for d in devs:
+        pm25, pm10 = f(d["pm25"]), f(d["pm10"])
+        out.append({"id": d["device_id"], "name": DEVICE_NAMES.get(d["device_id"], d["device_id"]),
+                    "online": bool(d["online"]), "level": int(d["last_level"] or 0),
+                    "co": f(d["co_ppm"]), "temp": f(d["temp_c"]), "pm25": pm25, "pm10": pm10,
+                    "smoke": pm25 >= TH["pm25_fire"] or pm10 >= TH["pm10_fire"]})
+    return {"gateway": {"online": bool(gw["online"])},
+            "packets": {"total": tot["n"],
+                        "last_ts": (last["ts"] if last else datetime.now(timezone.utc)).isoformat(),
+                        "rssi": round(last["rssi"]) if last and last["rssi"] is not None else 0},
+            "devices": out}
 
 # ---------- public read-only (website + mobile app) ----------
 @app.get("/api/v1/devices")
