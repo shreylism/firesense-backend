@@ -27,21 +27,21 @@ def _worker():
         try:
             if time.time() - last_hb > 30:
                 requests.post(URL + "/api/v1/gateway/heartbeat", json={"gateway_id": GATEWAY_ID},
-                              headers=HEADERS, timeout=5)
+                              headers=HEADERS, timeout=10)
                 last_hb = time.time()
             with _lock:
-                rows = _db.execute("select id, body from q order by id limit 50").fetchall()
+                rows = _db.execute("select id, body from q order by id desc limit 50").fetchall()
             if not rows:
                 time.sleep(1); continue
             r = requests.post(URL + "/api/v1/readings/batch", json=[json.loads(b) for _, b in rows],
-                              headers=HEADERS, timeout=10)
-            if r.status_code in (200, 201) or r.status_code == 422:   # 422 = bad data, drop it
+                              headers=HEADERS, timeout=60)
+            if r.status_code in (200, 201, 422):   # 422 = bad data, drop it
                 if r.status_code == 422:
                     print("FIRESENSE: dropped invalid batch:", r.text[:200])
                 with _lock:
-                    _db.execute("delete from q where id <= ?", (rows[-1][0],)); _db.commit()
+                    _db.executemany("delete from q where id = ?", [(i,) for i, _ in rows]); _db.commit()
             else:
-                print("FIRESENSE: upload failed", r.status_code, "will retry"); time.sleep(5)
+                print("FIRESENSE: upload failed", r.status_code, r.text[:200], "will retry"); time.sleep(5)
         except Exception as e:
             print("FIRESENSE: offline, will retry:", e); time.sleep(5)
 
