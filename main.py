@@ -5,9 +5,9 @@ from typing import List, Optional
 
 import firebase_admin
 from firebase_admin import credentials, messaging
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -421,3 +421,135 @@ def export_csv(device_id: str, hours: int = Query(168, ge=1, le=720)):
         w.writerow([r[k] for k in cols])
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=readings.csv"})
+
+# ---------- camera AI uploads (needs X-Camera-Key) ----------
+# Set CAMERA_API_KEY in Render and use the same value on the local AI server.
+CAMERA_API_KEY = os.environ.get("CAMERA_API_KEY", "")
+CAMERA_MAX_IMAGE_BYTES = 2 * 1024 * 1024  # 2 MB
+CAMERA_KEEP_PER_DEVICE = 500              # retain only the newest 500 images/device
+
+
+def check_camera_key(key: Optional[str]):
+    if not CAMERA_API_KEY:
+        raise HTTPException(503, "camera API is not configured")
+    if not key or not hmac.compare_digest(key, CAMERA_API_KEY):
+        raise HTTPException(401, "bad camera api key")
+
+
+@app.post("/api/v1/camera/snapshots", status_code=201)
+async def add_camera_snapshot(
+    request: Request,
+    device_id: str = Query(..., min_length=1, max_length=100),
+    prediction: str = Query(..., min_length=1, max_length=40),
+    confidence: float = Query(..., ge=0, le=100),
+    fire_probability: float = Query(..., ge=0, le=100),
+    alarm: bool = Query(False),
+    timestamp: Optional[datetime] = Query(None),
+    x_camera_key: Optional[str] = Header(None, alias="X-Camera-Key"),
+):
+    """Receive one JPEG from the local AI server and store it in PostgreSQL."""
+    check_camera_key(x_camera_key)
+
+    content_type = request.headers.get("content-type", "image/jpeg").split(";")[0].strip().lower()
+    if content_type not in ("image/jpeg", "image/jpg", "image/png"):
+        raise HTTPException(415, "only JPEG or PNG camera images are accepted")
+
+    image_bytes = await request.body()
+    if not image_bytes:
+        raise HTTPException(400, "empty image")
+    if len(image_bytes) > CAMERA_MAX_IMAGE_BYTES:
+        raise HTTPException(413, "image is larger than 2 MB")
+
+    # Keep all timestamps timezone-aware and in UTC.
+    captured_at = timestamp or datetime.now(timezone.utc)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    captured_at = captured_at.astimezone(timezone.utc)
+
+    with pool.connection() as c:
+        row = c.execute(
+            """insert into camera_snapshots
+               (device_id, captured_at, prediction, confidence, fire_probability,
+                alarm, content_type, image_bytes)
+               values (%s,%s,%s,%s,%s,%s,%s,%s)
+               returning id, device_id, captured_at, prediction, confidence,
+                         fire_probability, alarm""",
+            (device_id, captured_at, prediction, confidence, fire_probability,
+             alarm, content_type, image_bytes),
+        ).fetchone()
+
+        # Prevent unlimited database growth: keep only the newest N images per camera.
+        c.execute(
+            """delete from camera_snapshots
+               where device_id = %s
+                 and id not in (
+                     select id from camera_snapshots
+                     where device_id = %s
+                     order by captured_at desc, id desc
+                     limit %s
+                 )""",
+            (device_id, device_id, CAMERA_KEEP_PER_DEVICE),
+        )
+
+    return {
+        "stored": True,
+        "id": row["id"],
+        "device_id": row["device_id"],
+        "timestamp": row["captured_at"].isoformat(),
+        "prediction": row["prediction"],
+        "confidence": float(row["confidence"]),
+        "fire_probability": float(row["fire_probability"]),
+        "alarm": bool(row["alarm"]),
+        "image_url": f"/api/v1/camera/image/{row['id']}",
+    }
+
+
+@app.get("/api/v1/camera/snapshots")
+def get_camera_snapshots(request: Request, limit: int = Query(24, ge=1, le=100)):
+    """Return recent camera detections for the dashboard."""
+    with pool.connection() as c:
+        rows = c.execute(
+            """select id, device_id, captured_at, prediction, confidence,
+                      fire_probability, alarm
+               from camera_snapshots
+               order by captured_at desc, id desc
+               limit %s""",
+            (limit,),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        image_url = f"{str(request.base_url).rstrip('/')}/api/v1/camera/image/{row['id']}"
+        ts = row["captured_at"].isoformat()
+        items.append({
+            "id": row["id"],
+            "device_id": row["device_id"],
+            "ts": ts,
+            "timestamp": ts,
+            "prediction": row["prediction"],
+            "confidence": float(row["confidence"]),
+            "fire_probability": float(row["fire_probability"]),
+            "alarm": bool(row["alarm"]),
+            "url": image_url,
+            "image_url": image_url,
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/v1/camera/image/{snapshot_id}")
+def get_camera_image(snapshot_id: int):
+    """Serve a stored camera image to the dashboard."""
+    with pool.connection() as c:
+        row = c.execute(
+            "select content_type, image_bytes from camera_snapshots where id=%s",
+            (snapshot_id,),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(404, "camera image not found")
+
+    return Response(
+        content=bytes(row["image_bytes"]),
+        media_type=row["content_type"],
+        headers={"Cache-Control": "no-store"},
+    )
