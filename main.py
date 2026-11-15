@@ -28,9 +28,9 @@ ADMIN_TOKEN_HOURS = 8
 TH = {
     "temp_warn": 55.0, "temp_fire": 65.0,         # TMP117, deg C
     "rate_warn": 5.0,  "rate_fire": 8.0,          # deg C per minute
-    "co_warn": 25.0,   "co_fire": 50.0,           # ZE07 CO, ppm
-    "pm25_warn": 100.0, "pm25_fire": 200.0,       # SPS30, ug/m3
-    "pm10_warn": 150.0, "pm10_fire": 250.0,
+    "co_warn": 7.5,   "co_fire": 15.0,           # ZE07 CO, ppm
+    "pm25_warn": 25.0, "pm25_fire": 50.0,       # SPS30, ug/m3
+    "pm10_warn": 30.0, "pm10_fire": 50.0,
     "ir_warn": 1.0,    "ir_fire": 2.0,            # pyroelectric: 1 unusual, 2 persistent flame-like
 }
 LEVEL_NAMES = ["NORMAL", "WARNING", "FIRE SUSPECTED", "FIRE ALERT"]
