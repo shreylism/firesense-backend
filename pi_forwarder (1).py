@@ -8,7 +8,7 @@ URL = os.environ["FIRESENSE_URL"].rstrip("/")
 HEADERS = {"X-API-Key": os.environ["FIRESENSE_KEY"]}
 GATEWAY_ID = os.environ.get("GATEWAY_ID", "pi-gw-01")
 export CAMERA_URL=http://<camera-ip>/capture
-export CAMERA_KEY=<same value as CAMERA_API_KEY in Render>
+export CAMERA_KEY=9db066fa78241b7371ac02537f2af5cd1a65972a4eb036c0bd9d81b661f96c8e
 
 _db = sqlite3.connect("outbox.db", check_same_thread=False)
 _lock = threading.Lock()
