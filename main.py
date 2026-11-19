@@ -34,6 +34,30 @@ TH = {
     "ir_warn": 1.0,    "ir_fire": 2.0,            # pyroelectric: 1 unusual, 2 persistent flame-like
 }
 LEVEL_NAMES = ["NORMAL", "WARNING", "FIRE SUSPECTED", "FIRE ALERT"]
+LOGIC_VERSION = "firesense-central-v1"
+CAMERA_TRIGGER_LEVEL = 2  # FIRE SUSPECTED or FIRE ALERT; this is the sole camera trigger decision.
+
+
+def public_logic_config():
+    """Single source of truth consumed by the dashboard, Pi and device clients."""
+    return {
+        "logic_version": LOGIC_VERSION,
+        "thresholds": TH,
+        "levels": LEVEL_NAMES,
+        "camera_trigger_level": CAMERA_TRIGGER_LEVEL,
+        "camera_trigger_level_name": LEVEL_NAMES[CAMERA_TRIGGER_LEVEL],
+        "classification": {
+            "temperature": "temp_c >= temp_fire OR temp_rate_c_min >= rate_fire => strong temperature signal; warn thresholds produce WARNING",
+            "co": "co_ppm >= co_fire => strong CO signal; co_warn produces WARNING",
+            "particles": "pm25 >= pm25_fire OR pm10 >= pm10_fire => strong smoke signal; warn thresholds produce WARNING",
+            "infrared": "ir >= ir_fire => strong IR signal; ir_warn produces WARNING",
+            "level_3": "3 or more strong signal groups, OR strong IR plus at least one other strong group",
+            "level_2": "2 strong signal groups",
+            "level_1": "1 strong signal group or any warning signal",
+            "level_0": "no warning or strong signals",
+            "missing_sensors": "missing sensor values are ignored; they are not treated as zero",
+        },
+    }
 
 def classify(temp, rate, co, pm25, pm10, ir):
     """Return (level 0-3, list of reasons). Sensors that sent no value are ignored."""
@@ -291,6 +315,54 @@ def heartbeat(h: Heartbeat, x_api_key: Optional[str] = Header(None)):
                      on conflict (gateway_id) do update set last_seen = now()""", (h.gateway_id,))
     return {"ok": True}
 
+# ---------- canonical decision configuration (dashboard / Pi / device clients) ----------
+@app.get("/api/v1/config")
+def logic_config():
+    return public_logic_config()
+
+
+@app.get("/api/v1/devices/{device_id}/decision")
+def device_decision(device_id: str):
+    """Expose the exact backend decision; clients must display/use this, not reimplement thresholds."""
+    with pool.connection() as c:
+        row = c.execute(
+            """select d.last_seen, d.last_level,
+                      r.co_ppm, r.temp_c, r.pm25, r.pm10, r.pm1, r.pm4, r.ir
+               from devices d
+               left join lateral (
+                   select co_ppm, temp_c, pm25, pm10, pm1, pm4, ir
+                   from readings where device_id=d.device_id
+                   order by ts desc, id desc limit 1
+               ) r on true
+               where d.device_id=%s""",
+            (device_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "device has no readings yet")
+
+    online = bool(row["last_seen"] and row["last_seen"] > datetime.now(timezone.utc) - timedelta(seconds=ONLINE_SECONDS))
+    level = int(row["last_level"] or 0) if online else 0
+    return {
+        "device_id": device_id,
+        "online": online,
+        "level": level,
+        "level_name": LEVEL_NAMES[level],
+        "camera_trigger": bool(online and level >= CAMERA_TRIGGER_LEVEL),
+        "camera_trigger_level": CAMERA_TRIGGER_LEVEL,
+        "logic_version": LOGIC_VERSION,
+        "readings": {
+            "co_ppm": float(row["co_ppm"]) if row["co_ppm"] is not None else None,
+            "temp_c": float(row["temp_c"]) if row["temp_c"] is not None else None,
+            "pm25": float(row["pm25"]) if row["pm25"] is not None else None,
+            "pm10": float(row["pm10"]) if row["pm10"] is not None else None,
+            "pm1": float(row["pm1"]) if row["pm1"] is not None else None,
+            "pm4": float(row["pm4"]) if row["pm4"] is not None else None,
+            "ir": float(row["ir"]) if row["ir"] is not None else None,
+        },
+        "thresholds": TH,
+    }
+
+
 # ---------- phone notifications ----------
 @app.post("/api/v1/push/register")
 def push_register(t: PushToken):
@@ -347,10 +419,14 @@ def live_status():
         devs = c.execute(
             """select d.device_id, d.last_level,
                       (d.last_seen > now() - make_interval(secs => %s)) as online,
-                      r.co_ppm, r.temp_c, r.pm25, r.pm10
+                      r.co_ppm, r.temp_c, r.pm25, r.pm10, r.pm1, r.pm4, r.ir
                from devices d
-               left join lateral (select co_ppm, temp_c, pm25, pm10 from readings
-                                  where device_id = d.device_id order by ts desc limit 1) r on true
+               left join lateral (
+                   select co_ppm, temp_c, pm25, pm10, pm1, pm4, ir
+                   from readings
+                   where device_id = d.device_id
+                   order by ts desc, id desc limit 1
+               ) r on true
                order by d.device_id""", (ONLINE_SECONDS,)).fetchall()
         gw = c.execute("""select coalesce(bool_or(last_seen > now() - make_interval(secs => %s)), false) as online
                           from gateways""", (ONLINE_SECONDS,)).fetchone()
@@ -360,11 +436,19 @@ def live_status():
     out = []
     for d in devs:
         pm25, pm10 = f(d["pm25"]), f(d["pm10"])
+        online = bool(d["online"])
+        level = int(d["last_level"] or 0) if online else 0
         out.append({"id": d["device_id"], "name": DEVICE_NAMES.get(d["device_id"], d["device_id"]),
-                    "online": bool(d["online"]), "level": int(d["last_level"] or 0),
+                    "online": online, "level": level, "level_name": LEVEL_NAMES[level],
+                    "camera_trigger": bool(online and level >= CAMERA_TRIGGER_LEVEL),
                     "co": f(d["co_ppm"]), "temp": f(d["temp_c"]), "pm25": pm25, "pm10": pm10,
+                    "pm1": f(d["pm1"]), "pm4": f(d["pm4"]), "ir": f(d["ir"]),
                     "smoke": pm25 >= TH["pm25_fire"] or pm10 >= TH["pm10_fire"]})
-    return {"gateway": {"online": bool(gw["online"])},
+    return {"logic_version": LOGIC_VERSION,
+            "thresholds": TH,
+            "levels": LEVEL_NAMES,
+            "camera_trigger_level": CAMERA_TRIGGER_LEVEL,
+            "gateway": {"online": bool(gw["online"])},
             "packets": {"total": tot["n"],
                         "last_ts": (last["ts"] if last else datetime.now(timezone.utc)).isoformat(),
                         "rssi": round(last["rssi"]) if last and last["rssi"] is not None else 0},
