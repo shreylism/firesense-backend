@@ -31,7 +31,7 @@ TH = {
     "co_warn": 7.5,   "co_fire": 15.0,           # ZE07 CO, ppm
     "pm25_warn": 25.0, "pm25_fire": 50.0,       # SPS30, ug/m3
     "pm10_warn": 30.0, "pm10_fire": 50.0,
-    #"ir_warn": 1.0,    "ir_fire": 2.0,            # pyroelectric: 1 unusual, 2 persistent flame-like
+    "ir_warn": 1.0,    "ir_fire": 2.0,            # pyroelectric: 1 unusual, 2 persistent flame-like
 }
 LEVEL_NAMES = ["NORMAL", "WARNING", "FIRE SUSPECTED", "FIRE ALERT"]
 LOGIC_VERSION = "firesense-central-v1"
