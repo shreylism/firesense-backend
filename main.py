@@ -26,7 +26,7 @@ ADMIN_TOKEN_HOURS = 8
 
 # ---------- fire decision thresholds (prototype values) ----------
 TH = {
-    "temp_warn": 35.0, "temp_fire": 40.0,         # TMP117, deg C
+    "temp_warn": 45.0, "temp_fire": 50.0,         # TMP117, deg C
     "rate_warn": 5.0,  "rate_fire": 8.0,          # deg C per minute
     "co_warn": 7.5,   "co_fire": 15.0,           # ZE07 CO, ppm
     "pm25_warn": 200.0, "pm25_fire": 250.0,       # SPS30, ug/m3
